@@ -1,0 +1,249 @@
+name: Update Project status after PR merge
+
+on:
+  pull_request:
+    types: [closed]
+    branches:
+      - 'release-Raptor-[0-9][0-9].[0-9][0-9]'
+      - 'release-RaptorService-[0-9][0-9].[0-9][0-9]'
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: project-status-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  update-project-issues:
+    name: Move In development to Ready for next beta
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Update Project issues
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.PROJECTS_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${GH_TOKEN:-}" ]]; then
+            echo "::error::PROJECTS_TOKEN is not configured."
+            exit 1
+          fi
+
+          # Select the Project based on the PR target branch.
+          if [[ "$BASE_REF" =~ ^release-Raptor-[0-9]{2}\.[0-9]{2}$ ]]; then
+            PROJECT_NAME="SANDBOX - Raptor Automation"
+            PROJECT_NUMBER=11
+            PROJECT_ID="PVT_kwHOECsPhs4BtXN2"
+            FIELD_ID="PVTSSF_lAHOECsPhs4BtXN2zhrhDXg"
+            OPT_IN_DEV="f180cce1"
+            OPT_READY="a7678a92"
+            OPT_DONE="d7f187ed"
+
+          elif [[ "$BASE_REF" =~ ^release-RaptorService-[0-9]{2}\.[0-9]{2}$ ]]; then
+            PROJECT_NAME="SANDBOX - RaptorService Automation"
+            PROJECT_NUMBER=12
+            PROJECT_ID="PVT_kwHOECsPhs4BtXN4"
+            FIELD_ID="PVTSSF_lAHOECsPhs4BtXN4zhrhDaY"
+            OPT_IN_DEV="eb53fa21"
+            OPT_READY="3dfcdbb1"
+            OPT_DONE="abc544d5"
+
+          else
+            echo "Unsupported target branch: $BASE_REF"
+            exit 0
+          fi
+
+          if [[ "$PROJECT_NUMBER" == "10" ]]; then
+            echo "::error::Refusing to modify Project 10."
+            exit 1
+          fi
+
+          OWNER="${REPO%%/*}"
+          NAME="${REPO##*/}"
+
+          echo "Merged PR: #$PR_NUMBER"
+          echo "Target branch: $BASE_REF"
+          echo "Selected project: $PROJECT_NAME (#$PROJECT_NUMBER)"
+
+          # Retrieve only commits belonging to this PR.
+          if ! MESSAGES=$(gh api --paginate \
+            "repos/$REPO/pulls/$PR_NUMBER/commits" \
+            --jq '.[].commit.message'); then
+            echo "::error::Could not retrieve PR commits."
+            exit 1
+          fi
+
+          # Extract and deduplicate actual GitHub Issue references.
+          # Exclude the PR's own number and URL fragments.
+          mapfile -t ISSUES < <(
+            printf '%s\n' "$MESSAGES" |
+              {
+                grep -oP '(?<![\w&/])#\K[0-9]{1,9}(?!\w)' || true
+              } |
+              sed 's/^0*//' |
+              {
+                grep -v '^$' || true
+              } |
+              {
+                grep -vx "$PR_NUMBER" || true
+              } |
+              sort -nu
+          )
+
+          if [[ "${#ISSUES[@]}" -eq 0 ]]; then
+            echo "No GitHub Issue references found in the merged PR commits."
+            exit 0
+          fi
+
+          echo "Issue references found: ${ISSUES[*]}"
+
+          ISSUE_QUERY='
+          query($owner: String!, $repo: String!, $number: Int!) {
+            repository(owner: $owner, name: $repo) {
+              issue(number: $number) {
+                id
+                number
+                projectItems(first: 100, includeArchived: false) {
+                  nodes {
+                    id
+                    project { id number }
+                    fieldValueByName(name: "Automation Status") {
+                      ... on ProjectV2ItemFieldSingleSelectValue {
+                        optionId
+                        name
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }'
+
+          UPDATE_MUTATION='
+          mutation($project: ID!, $item: ID!, $field: ID!, $option: String!) {
+            updateProjectV2ItemFieldValue(input: {
+              projectId: $project
+              itemId: $item
+              fieldId: $field
+              value: { singleSelectOptionId: $option }
+            }) {
+              projectV2Item { id }
+            }
+          }'
+
+          UPDATED=0
+          SKIPPED=0
+          WARNED=0
+
+          process_issue() {
+            local n="$1"
+            local resp issue_id item item_id opt_id status_name
+
+            echo "::group::GitHub Issue #$n"
+            echo "Processing GitHub issue #$n."
+
+            if ! resp=$(gh api graphql \
+              -f query="$ISSUE_QUERY" \
+              -f owner="$OWNER" \
+              -f repo="$NAME" \
+              -F number="$n"); then
+              echo "::warning::Could not query issue #$n."
+              WARNED=$((WARNED + 1))
+              echo "::endgroup::"
+              return 0
+            fi
+
+            issue_id=$(jq -r \
+              '.data.repository.issue.id // empty' <<< "$resp")
+
+            if [[ -z "$issue_id" ]]; then
+              echo "Issue #$n does not exist or is not accessible. Skipping."
+              SKIPPED=$((SKIPPED + 1))
+              echo "::endgroup::"
+              return 0
+            fi
+
+            item=$(jq -c --arg pid "$PROJECT_ID" '
+              [
+                .data.repository.issue.projectItems.nodes[]?
+                | select(.project.id == $pid)
+              ] | first // empty
+            ' <<< "$resp")
+
+            if [[ -z "$item" ]]; then
+              echo "Issue #$n is not part of Project #$PROJECT_NUMBER. Skipping."
+              SKIPPED=$((SKIPPED + 1))
+              echo "::endgroup::"
+              return 0
+            fi
+
+            item_id=$(jq -r '.id' <<< "$item")
+            opt_id=$(jq -r \
+              '.fieldValueByName.optionId // empty' <<< "$item")
+            status_name=$(jq -r \
+              '.fieldValueByName.name // "(not set)"' <<< "$item")
+
+            echo "Current Automation Status: $status_name"
+
+            if [[ "$opt_id" == "$OPT_READY" ]]; then
+              echo "Issue #$n is already Ready for next beta. Skipping."
+              SKIPPED=$((SKIPPED + 1))
+              echo "::endgroup::"
+              return 0
+            fi
+
+            if [[ "$opt_id" == "$OPT_DONE" ]]; then
+              echo "Issue #$n is Done. Skipping."
+              SKIPPED=$((SKIPPED + 1))
+              echo "::endgroup::"
+              return 0
+            fi
+
+            if [[ "$opt_id" != "$OPT_IN_DEV" ]]; then
+              echo "Issue #$n is not In development. Skipping."
+              SKIPPED=$((SKIPPED + 1))
+              echo "::endgroup::"
+              return 0
+            fi
+
+            if gh api graphql \
+              -f query="$UPDATE_MUTATION" \
+              -f project="$PROJECT_ID" \
+              -f item="$item_id" \
+              -f field="$FIELD_ID" \
+              -f option="$OPT_READY" >/dev/null; then
+              echo "Issue #$n updated successfully."
+              UPDATED=$((UPDATED + 1))
+            else
+              echo "::warning::Could not update issue #$n."
+              WARNED=$((WARNED + 1))
+            fi
+
+            echo "::endgroup::"
+          }
+
+          for n in "${ISSUES[@]}"; do
+            process_issue "$n"
+          done
+
+          echo "Updated: $UPDATED | Skipped: $SKIPPED | Warnings: $WARNED"
+
+          {
+            echo "### Project status sync"
+            echo "- PR: #$PR_NUMBER"
+            echo "- Target branch: $BASE_REF"
+            echo "- Project: $PROJECT_NAME (#$PROJECT_NUMBER)"
+            echo "- Issues: ${ISSUES[*]}"
+            echo "- Updated: $UPDATED"
+            echo "- Skipped: $SKIPPED"
+            echo "- Warnings: $WARNED"
+          } >> "$GITHUB_STEP_SUMMARY"
