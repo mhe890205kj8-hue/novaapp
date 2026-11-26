@@ -5,7 +5,7 @@
 # Creates (in a throw-away repo, NOT in novaapp):
 #   * 2 Projects V2 with an "Automation Status" single-select field
 #     (In development / Ready for next beta / Test in beta / Done)
-#   * the release branches + decoy branch
+#   * the release branches (release-<Name>-YY.S) + a decoy branch
 #   * issues sitting in every status / project combination
 #   * a patched copy of the workflow (new project + field + option IDs)
 #
@@ -31,10 +31,12 @@ set -euo pipefail
 STATE_DIR="${STATE_DIR:-.test-env}"
 STATE_FILE="$STATE_DIR/state.env"
 
-# Branches used by the tests (3-group version numbers, as in the workflow).
-BR_RAPTOR="release-Raptor-99.99.99"
-BR_SERVICE="release-RaptorService-99.99.99"
-BR_LEGACY="release-Raptor-12.05"          # old 2-group format: must NOT trigger
+# Branches used by the tests. Format: release-<Name>-YY.S (year . sprint number).
+BR_RAPTOR="release-Raptor-26.1"
+BR_SERVICE="release-RaptorService-26.1"
+BR_RAPTOR_NEW="release-Raptor-26.2"         # "new sprint" branch, created during `run`
+BR_SERVICE_NEW="release-RaptorService-26.12" # new sprint branch with a 2-digit sprint number
+BR_DECOY="release-Raptor-26.1.1"            # not a valid sprint branch: must NOT trigger
 
 # Original IDs hard-coded in the workflow (replaced by the new ones).
 OLD_RP_ID="PVT_kwHOECsPhs4BtFjj";  OLD_RP_FIELD="PVTSSF_lAHOECsPhs4BtFjjzhrQqEA"
@@ -55,10 +57,12 @@ r_none|-|-
 both_dev|dev|dev
 s_only_dev|-|dev
 r_closed|dev|-
-r_legacy|dev|-
+r_decoy|dev|-
 s_dev1|-|dev
 s_done|-|done
 s_direct|-|dev
+r_sprint2|dev|-
+s_sprint12|-|dev
 '
 
 # key | project | expected status AFTER the test run (independent oracle)
@@ -76,10 +80,12 @@ both_dev|SP|In development
 s_only_dev|RP|(not in project)
 s_only_dev|SP|In development
 r_closed|RP|In development
-r_legacy|RP|In development
+r_decoy|RP|In development
 s_dev1|SP|Ready for next beta
 s_done|SP|Done
 s_direct|SP|In development
+r_sprint2|RP|Ready for next beta
+s_sprint12|SP|Ready for next beta
 '
 
 log()  { printf '\n==> %s\n' "$*"; }
@@ -246,7 +252,7 @@ cmd_setup() {
 
   log "Branches"
   local sha; sha=$(branch_sha "$DEFAULT_BRANCH")
-  for b in "$BR_RAPTOR" "$BR_SERVICE" "$BR_LEGACY"; do create_branch "$b" "$sha"; info "$b"; done
+  for b in "$BR_RAPTOR" "$BR_SERVICE" "$BR_DECOY"; do create_branch "$b" "$sha"; info "$b"; done
 
   log "Issues"
   local line key rp sp url num
@@ -301,12 +307,16 @@ wait_runs() { # expected_count
     sleep 8
   done
   jq -r '.[] | "    \(.event)  \(.headBranch)  status=\(.status)  conclusion=\(.conclusion)"' <<<"$json"
-  info "(expected: pr-a success, pr-b success, pr-c skipped; none for legacy PR or direct push)"
+  info "(expected: pr-a, pr-b, pr-e, pr-f success; pr-c skipped; none for the decoy PR or direct push)"
 }
 
 cmd_run() {
   load
-  local A B C D
+  local A B C D E F sha
+  log "Simulating new sprints: creating $BR_RAPTOR_NEW and $BR_SERVICE_NEW"
+  sha=$(branch_sha "$DEFAULT_BRANCH")
+  create_branch "$BR_RAPTOR_NEW" "$sha"; create_branch "$BR_SERVICE_NEW" "$sha"
+
   log "Opening test PRs"
   A=$(make_pr pr-a "$BR_RAPTOR" \
         "Fix login validation #$(inum r_dev1)" \
@@ -318,19 +328,25 @@ cmd_run() {
   info "PR B #$B -> $BR_SERVICE   (to be MERGED)"
   C=$(make_pr pr-c "$BR_RAPTOR" "WIP #$(inum r_closed)")
   info "PR C #$C -> $BR_RAPTOR   (to be CLOSED without merge)"
-  D=$(make_pr pr-d "$BR_LEGACY" "Legacy branch #$(inum r_legacy)")
-  info "PR D #$D -> $BR_LEGACY   (to be MERGED, old branch format)"
+  D=$(make_pr pr-d "$BR_DECOY" "Decoy branch #$(inum r_decoy)")
+  info "PR D #$D -> $BR_DECOY   (to be MERGED, not a sprint branch)"
+  E=$(make_pr pr-e "$BR_RAPTOR_NEW" "New sprint fix #$(inum r_sprint2)")
+  info "PR E #$E -> $BR_RAPTOR_NEW   (to be MERGED, new sprint branch)"
+  F=$(make_pr pr-f "$BR_SERVICE_NEW" "New sprint service fix #$(inum s_sprint12)")
+  info "PR F #$F -> $BR_SERVICE_NEW   (to be MERGED, 2-digit sprint)"
 
   log "Merging / closing"
   merge_pr "$A"; info "merged #$A"
   merge_pr "$B"; info "merged #$B"
   gh pr close "$C" --repo "$REPO" >/dev/null; info "closed #$C"
   merge_pr "$D"; info "merged #$D"
+  merge_pr "$E"; info "merged #$E"
+  merge_pr "$F"; info "merged #$F"
 
   log "Direct push to $BR_SERVICE (must NOT trigger)"
   put_file "$BR_SERVICE" "tests/direct-push.txt" "Direct push #$(inum s_direct)" "direct push"
 
-  wait_runs 3
+  wait_runs 5
   cmd_verify
 }
 
