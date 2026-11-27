@@ -13,6 +13,7 @@
 #   setup      create everything
 #   run        open + merge/close test PRs, wait for the workflow, then verify
 #   verify     compare real Project statuses with the expected ones
+#   fallback   manually trigger the scheduled fallback scan, wait, then verify
 #   teardown   delete the sandbox repo and both projects
 #
 # Requirements: gh (authenticated), jq, base64.
@@ -36,6 +37,7 @@ BR_RAPTOR="release-Raptor-26.1"
 BR_SERVICE="release-RaptorService-26.1"
 BR_RAPTOR_NEW="release-Raptor-26.2"         # "new sprint" branch, created during `run`
 BR_SERVICE_NEW="release-RaptorService-26.12" # new sprint branch with a 2-digit sprint number
+BR_NOFILE="release-Raptor-25.9"            # old release branch WITHOUT the workflow file
 BR_DECOY="release-Raptor-26.1.1"            # not a valid sprint branch: must NOT trigger
 
 # Original IDs hard-coded in the workflow (replaced by the new ones).
@@ -65,6 +67,8 @@ r_sprint2|dev|-
 s_sprint12|-|dev
 r_cherry|dev|-
 s_cherry|-|dev
+r_push_cp|dev|-
+r_nofile|dev|-
 '
 
 # key | project | expected status AFTER the test run (independent oracle)
@@ -85,11 +89,13 @@ r_closed|RP|In development
 r_decoy|RP|In development
 s_dev1|SP|Ready for next beta
 s_done|SP|Done
-s_direct|SP|In development
+s_direct|SP|Ready for next beta
 r_sprint2|RP|Ready for next beta
 s_sprint12|SP|Ready for next beta
 r_cherry|RP|Ready for next beta
 s_cherry|SP|Ready for next beta
+r_push_cp|RP|Ready for next beta
+r_nofile|RP|Ready for next beta
 '
 
 log()  { printf '\n==> %s\n' "$*"; }
@@ -239,6 +245,7 @@ cmd_setup() {
   fi
   save REPO "$REPO"; save OWNER_ARG "$OWNER_ARG"
   DEFAULT_BRANCH=$(gh api "repos/$REPO" --jq .default_branch); save DEFAULT_BRANCH "$DEFAULT_BRANCH"
+  INIT_SHA=$(branch_sha "$DEFAULT_BRANCH"); save INIT_SHA "$INIT_SHA"   # commit before the workflow exists
 
   log "Projects and Automation Status fields"
   create_project RP "SANDBOX - Raptor Automation"
@@ -257,6 +264,7 @@ cmd_setup() {
   log "Branches"
   local sha; sha=$(branch_sha "$DEFAULT_BRANCH")
   for b in "$BR_RAPTOR" "$BR_SERVICE" "$BR_DECOY"; do create_branch "$b" "$sha"; info "$b"; done
+  create_branch "$BR_NOFILE" "$INIT_SHA"; info "$BR_NOFILE  (cut BEFORE the workflow was added: has no workflow file)"
 
   log "Issues"
   local line key rp sp url num
@@ -299,19 +307,22 @@ merge_pr() {
   die "Could not merge PR #$n"
 }
 
-wait_runs() { # expected_count
-  local want="$1" json total pending deadline=$((SECONDS+300))
-  log "Waiting for $want workflow runs (up to 5 min)"
+wait_runs() {
+  local json total pending calm=0 deadline=$((SECONDS+360))
+  log "Waiting for workflow runs to finish (up to 6 min)"
+  sleep 20
   while (( SECONDS < deadline )); do
-    json=$(gh run list --repo "$REPO" --workflow update-project-on-merge.yml --limit 30 \
+    json=$(gh run list --repo "$REPO" --workflow update-project-on-merge.yml --limit 50 \
              --json status,conclusion,event,headBranch 2>/dev/null || echo '[]')
     total=$(jq length <<<"$json")
     pending=$(jq '[.[]|select(.status!="completed")]|length' <<<"$json")
-    if (( total >= want && pending == 0 )); then break; fi
-    sleep 8
+    if (( total >= 6 && pending == 0 )); then calm=$((calm+1)); else calm=0; fi
+    (( calm >= 2 )) && break
+    sleep 10
   done
-  jq -r '.[] | "    \(.event)  \(.headBranch)  status=\(.status)  conclusion=\(.conclusion)"' <<<"$json"
-  info "(expected: pr-a, pr-b, pr-e, pr-f, pr-g, pr-h success; pr-c skipped; none for the decoy PR or direct push)"
+  jq -r '.[] | "    \(.event)  \(.headBranch)  conclusion=\(.conclusion)"' <<<"$json"
+  info "(pull_request runs: pr-a/b/e/f/g/h success, pr-c skipped. push runs: one per merge / direct push.)"
+  info "(No run for the PR into $BR_DECOY or pushes to non-release branches; $BR_NOFILE has no workflow file.)"
 }
 
 cmd_run() {
@@ -362,11 +373,31 @@ cmd_run() {
   H=$(make_pr pr-h "$BR_SERVICE" "Backport of service feature B"$'\n\n'"(cherry picked from commit $sha)")
   merge_pr "$H"; info "backport PR #$H merged into $BR_SERVICE  (refs only commit ${sha:0:10})"
 
-  log "Direct push to $BR_SERVICE (must NOT trigger)"
+  log "Direct pushes straight onto release branches (must trigger via the push event)"
   put_file "$BR_SERVICE" "tests/direct-push.txt" "Direct push #$(inum s_direct)" "direct push"
+  info "pushed a commit referencing #$(inum s_direct) to $BR_SERVICE"
+  local M3
+  M3=$(make_pr main-c "$DEFAULT_BRANCH" "Feature C #$(inum r_push_cp)")
+  merge_pr "$M3" --squash
+  sha=$(gh pr view "$M3" --repo "$REPO" --json mergeCommit --jq .mergeCommit.oid)
+  put_file "$BR_RAPTOR" "tests/cherry-pick-push.txt" \
+    "Backport of feature C"$'\n\n'"(cherry picked from commit $sha)" "cherry-pick push"
+  info "pushed a cherry-pick (-x style, commit ${sha:0:10}) to $BR_RAPTOR"
+  put_file "$BR_NOFILE" "tests/nofile.txt" "Cherry-pick onto old release branch #$(inum r_nofile)" "no workflow file here"
+  info "pushed a commit referencing #$(inum r_nofile) to $BR_NOFILE (no workflow file on that branch: only the scheduled fallback can catch it)"
 
-  wait_runs 7
+  wait_runs
+
+  log "Fallback run from $DEFAULT_BRANCH (what the 15-minute schedule does)"
+  fallback
   cmd_verify
+}
+
+fallback() {
+  sleep 30   # the events API lags a little behind real pushes
+  gh workflow run update-project-on-merge.yml --repo "$REPO" --ref "$DEFAULT_BRANCH" -f lookback_minutes=120 >/dev/null
+  info "dispatched manually (lookback 120 min)"
+  wait_runs
 }
 
 # ---------------------------------------------------------------- verify
@@ -415,6 +446,7 @@ main() {
     setup)    cmd_setup ;;
     run)      cmd_run ;;
     verify)   cmd_verify ;;
+    fallback) load; fallback; cmd_verify ;;
     teardown) shift; cmd_teardown "$@" ;;
     *) sed -n '3,22p' "$0"; exit 1 ;;
   esac

@@ -1,7 +1,18 @@
 name: Update Project status after PR merge
 
-# Runs ONLY when a pull request is closed AND merged into a supported release branch.
-# A plain push to a release branch never triggers this workflow.
+# Runs when
+#   * a pull request is MERGED into a supported release branch, or
+#   * commits are PUSHED to a supported release branch (e.g. a cherry-pick pushed straight
+#     onto the release branch from SourceTree / git, where no pull request exists), or
+#   * on a schedule / manually (fallback, see below).
+# A pull request that is closed without merging does nothing.
+#
+# WHY THE FALLBACK: GitHub runs the workflow file found ON THE BRANCH that was pushed to.
+# A release branch that does not contain this file (e.g. created before it was added)
+# never triggers the push/pull_request runs. Scheduled and manual runs always use the
+# default branch, so every ~15 min they look at recent pushes to ALL release branches
+# (GitHub events API) and process them, whether or not the branch has this file.
+# Reprocessing is harmless: only issues still "In development" are ever changed.
 on:
   pull_request:
     types: [closed]
@@ -16,22 +27,94 @@ on:
       - 'release-Raptor-[0-9][0-9].[0-9][0-9]'
       - 'release-RaptorService-[0-9][0-9].[0-9]'
       - 'release-RaptorService-[0-9][0-9].[0-9][0-9]'
+  push:
+    branches:
+      # Same patterns as above (YAML anchors are avoided for compatibility).
+      - 'release-Raptor-[0-9][0-9].[0-9]'
+      - 'release-Raptor-[0-9][0-9].[0-9][0-9]'
+      - 'release-RaptorService-[0-9][0-9].[0-9]'
+      - 'release-RaptorService-[0-9][0-9].[0-9][0-9]'
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+    inputs:
+      lookback_minutes:
+        description: 'Process pushes to release branches made in the last N minutes'
+        required: false
+        default: '60'
 
 permissions:
   contents: read
   pull-requests: read
 
-# One run per PR at a time; never cancel a run that is mid-update.
-concurrency:
-  group: project-status-pr-${{ github.event.pull_request.number }}
-  cancel-in-progress: false
-
 jobs:
+  # Decides WHAT to process: the merged PR's base branch, the pushed branch, or (schedule /
+  # manual run) every release branch that received a push in the lookback window.
+  discover:
+    name: Find release branches to process
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.find.outputs.matrix }}
+      count: ${{ steps.find.outputs.count }}
+    steps:
+      - id: find
+        env:
+          GH_TOKEN: ${{ secrets.PROJECTS_TOKEN }}
+          REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          MERGED: ${{ github.event.pull_request.merged }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          REF_NAME: ${{ github.ref_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.event.after }}
+          LOOKBACK_MIN: ${{ github.event.inputs.lookback_minutes || '60' }}
+        run: |
+          set +e
+          set -uo pipefail
+
+          BRANCH_RX='^release-(Raptor|RaptorService)-[0-9]{2}\.[0-9]{1,2}$'
+          MATRIX='[]'
+
+          case "$EVENT_NAME" in
+            pull_request)
+              if [ "$MERGED" = true ] && [[ "$BASE_REF" =~ $BRANCH_RX ]]; then
+                MATRIX=$(jq -nc --arg b "$BASE_REF" '[{branch:$b, event:"pull_request", before:"", after:""}]')
+              else
+                echo "Pull request was not merged into a release branch. Nothing to do."
+              fi ;;
+            push)
+              MATRIX=$(jq -nc --arg b "$REF_NAME" --arg x "$BEFORE_SHA" --arg y "$AFTER_SHA" \
+                         '[{branch:$b, event:"push", before:$x, after:$y}]') ;;
+            *)
+              since=$(date -u -d "-${LOOKBACK_MIN} minutes" +%Y-%m-%dT%H:%M:%SZ)
+              echo "Scanning pushes to release branches since $since..."
+              EVENTS=$(gh api --paginate "repos/${REPO}/events?per_page=100" \
+                         --jq '.[] | select(.type=="PushEvent")
+                               | {ref: .payload.ref, before: .payload.before, after: .payload.head, at: .created_at}')
+              MATRIX=$(jq -sc --arg since "$since" \
+                         --arg rx '^refs/heads/release-(Raptor|RaptorService)-[0-9]{2}\.[0-9]{1,2}$' \
+                         '[.[] | select(.at >= $since) | select(.ref | test($rx))
+                           | {branch: (.ref | sub("^refs/heads/"; "")), event: "push", before, after}] | unique' \
+                         <<<"$EVENTS")
+              [ -n "$MATRIX" ] || MATRIX='[]' ;;
+          esac
+
+          COUNT=$(jq length <<<"$MATRIX")
+          echo "Branches/pushes to process: $COUNT"
+          jq -r '.[] | "  \(.branch)  \(.event)  \(.before[0:10])..\(.after[0:10])"' <<<"$MATRIX"
+          { echo "matrix=$MATRIX"; echo "count=$COUNT"; } >> "$GITHUB_OUTPUT"
+
   update-project-issues:
-    name: Move In development -> Ready for next beta
-    if: github.event.pull_request.merged == true
+    name: Move In development -> Ready for next beta (${{ matrix.branch }})
+    needs: discover
+    if: ${{ needs.discover.outputs.count != '0' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.discover.outputs.matrix) }}
 
     steps:
       # ------------------------------------------------------------------
@@ -39,7 +122,7 @@ jobs:
       # ------------------------------------------------------------------
       - name: Select Project from target branch
         env:
-          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          BASE_REF: ${{ matrix.branch }}
         run: |
           set -euo pipefail
 
@@ -77,10 +160,13 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.PROJECTS_TOKEN }}
           REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          EVENT_NAME: ${{ matrix.event }}
+          BEFORE_SHA: ${{ matrix.before }}
+          AFTER_SHA: ${{ matrix.after }}
+          PR_NUMBER: ${{ github.event.pull_request.number || 0 }}
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_BODY: ${{ github.event.pull_request.body }}
-          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          BASE_REF: ${{ matrix.branch }}
         run: |
           # GitHub starts this shell as `bash -e`, so -e must be switched off explicitly:
           # one bad issue (or `read -d ''` returning 1 at EOF) must never abort the run.
@@ -103,7 +189,7 @@ jobs:
           ERR_FILE="$(mktemp)"
 
           echo "Target project: $PROJECT_NAME (#$PROJECT_NUMBER)"
-          echo "Collecting references for pull request #$PR_NUMBER..."
+          echo "Event: $EVENT_NAME on $BASE_REF"
 
           # "#123" references: not glued to a word char, '&' (HTML entities) or '/' (URLs);
           # leading zeros dropped. Output is one number per line.
@@ -150,9 +236,23 @@ jobs:
               <<<"$resp" 2>/dev/null
           }
 
-          if ! MESSAGES=$(pr_commit_messages "$PR_NUMBER" 2>"$ERR_FILE"); then
-            echo "::error::Could not list commits of PR #$PR_NUMBER: $(cat "$ERR_FILE")"
-            exit 1
+          if [ "$EVENT_NAME" = push ]; then
+            if [[ "$BEFORE_SHA" =~ ^0+$ ]]; then
+              echo "Branch $BASE_REF was just created. No new commits to process."
+              exit 0
+            fi
+            echo "Push to $BASE_REF: ${BEFORE_SHA:0:10}..${AFTER_SHA:0:10}"
+            if ! MESSAGES=$(gh api --paginate "repos/${REPO}/compare/${BEFORE_SHA}...${AFTER_SHA}" \
+                              --jq '.commits[].commit.message' 2>"$ERR_FILE"); then
+              echo "::warning::Could not compare pushed commits (force push?): $(head -c 300 "$ERR_FILE"). Nothing processed."
+              exit 0
+            fi
+          else
+            echo "Merged pull request #$PR_NUMBER."
+            if ! MESSAGES=$(pr_commit_messages "$PR_NUMBER" 2>"$ERR_FILE"); then
+              echo "::error::Could not list commits of PR #$PR_NUMBER: $(cat "$ERR_FILE")"
+              exit 1
+            fi
           fi
 
           # Text of the PR being processed: its commits, title and description.
@@ -297,7 +397,7 @@ jobs:
           echo "Done. Updated: $UPDATED, skipped: $SKIPPED, warnings: $WARNED."
           {
             echo "### Project status sync"
-            echo "- PR: #$PR_NUMBER -> \`$BASE_REF\`"
+            echo "- Trigger: $EVENT_NAME on \`$BASE_REF\` (PR #$PR_NUMBER)"
             echo "- Project: $PROJECT_NAME (#$PROJECT_NUMBER)"
             echo "- Issues referenced: ${ISSUES[*]/#/#}"
             echo "- Updated: **$UPDATED** · Skipped: $SKIPPED · Warnings: $WARNED"
