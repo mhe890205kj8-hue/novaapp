@@ -63,6 +63,8 @@ s_done|-|done
 s_direct|-|dev
 r_sprint2|dev|-
 s_sprint12|-|dev
+r_cherry|dev|-
+s_cherry|-|dev
 '
 
 # key | project | expected status AFTER the test run (independent oracle)
@@ -86,6 +88,8 @@ s_done|SP|Done
 s_direct|SP|In development
 r_sprint2|RP|Ready for next beta
 s_sprint12|SP|Ready for next beta
+r_cherry|RP|Ready for next beta
+s_cherry|SP|Ready for next beta
 '
 
 log()  { printf '\n==> %s\n' "$*"; }
@@ -282,14 +286,14 @@ make_pr() { # name base_branch msg...   -> prints PR number
     put_file "$head" "tests/$name-$i.txt" "$msg" "$name commit $i"
   done
   url=$(gh pr create --repo "$REPO" --base "$base" --head "$head" \
-          --title "Test $name -> $base" --body "Automated test PR")
+          --title "Test $name -> $base" --body "${PR_BODY:-Automated test PR}")
   printf '%s' "${url##*/}"
 }
 
 merge_pr() {
-  local n="$1" t
+  local n="$1" mode="${2:---merge}" t
   for t in 1 2 3 4 5 6; do
-    gh pr merge "$n" --repo "$REPO" --merge >/dev/null 2>&1 && return 0
+    gh pr merge "$n" --repo "$REPO" "$mode" >/dev/null 2>&1 && return 0
     sleep 4
   done
   die "Could not merge PR #$n"
@@ -307,12 +311,12 @@ wait_runs() { # expected_count
     sleep 8
   done
   jq -r '.[] | "    \(.event)  \(.headBranch)  status=\(.status)  conclusion=\(.conclusion)"' <<<"$json"
-  info "(expected: pr-a, pr-b, pr-e, pr-f success; pr-c skipped; none for the decoy PR or direct push)"
+  info "(expected: pr-a, pr-b, pr-e, pr-f, pr-g, pr-h success; pr-c skipped; none for the decoy PR or direct push)"
 }
 
 cmd_run() {
   load
-  local A B C D E F sha
+  local A B C D E F G H M1 M2 sha
   log "Simulating new sprints: creating $BR_RAPTOR_NEW and $BR_SERVICE_NEW"
   sha=$(branch_sha "$DEFAULT_BRANCH")
   create_branch "$BR_RAPTOR_NEW" "$sha"; create_branch "$BR_SERVICE_NEW" "$sha"
@@ -343,10 +347,25 @@ cmd_run() {
   merge_pr "$E"; info "merged #$E"
   merge_pr "$F"; info "merged #$F"
 
+  log "Cherry-pick scenarios: squash-merge into $DEFAULT_BRANCH first, then backport"
+  # G: the backport only carries the main PR number "(#M1)"; the issue is linked via
+  #    "Closes #N" in the main PR description (no issue number in any commit message).
+  M1=$(PR_BODY="Closes #$(inum r_cherry)" make_pr main-a "$DEFAULT_BRANCH" "Feature A without issue reference")
+  sleep 5
+  merge_pr "$M1" --squash; info "main PR #$M1 squash-merged into $DEFAULT_BRANCH"
+  G=$(make_pr pr-g "$BR_RAPTOR" "Feature A without issue reference (#$M1)")
+  merge_pr "$G"; info "backport PR #$G merged into $BR_RAPTOR  (refs only the main PR #$M1)"
+  # H: git cherry-pick -x style message; the issue number lives only in the main commit.
+  M2=$(make_pr main-b "$DEFAULT_BRANCH" "Service feature B #$(inum s_cherry)")
+  merge_pr "$M2" --squash
+  sha=$(gh pr view "$M2" --repo "$REPO" --json mergeCommit --jq .mergeCommit.oid)
+  H=$(make_pr pr-h "$BR_SERVICE" "Backport of service feature B"$'\n\n'"(cherry picked from commit $sha)")
+  merge_pr "$H"; info "backport PR #$H merged into $BR_SERVICE  (refs only commit ${sha:0:10})"
+
   log "Direct push to $BR_SERVICE (must NOT trigger)"
   put_file "$BR_SERVICE" "tests/direct-push.txt" "Direct push #$(inum s_direct)" "direct push"
 
-  wait_runs 5
+  wait_runs 7
   cmd_verify
 }
 

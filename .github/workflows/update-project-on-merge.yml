@@ -78,6 +78,8 @@ jobs:
           GH_TOKEN: ${{ secrets.PROJECTS_TOKEN }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
           BASE_REF: ${{ github.event.pull_request.base.ref }}
         run: |
           # GitHub starts this shell as `bash -e`, so -e must be switched off explicitly:
@@ -101,25 +103,100 @@ jobs:
           ERR_FILE="$(mktemp)"
 
           echo "Target project: $PROJECT_NAME (#$PROJECT_NUMBER)"
-          echo "Collecting commits of pull request #$PR_NUMBER..."
+          echo "Collecting references for pull request #$PR_NUMBER..."
 
-          # Note: this endpoint returns at most 250 commits per PR.
-          if ! MESSAGES=$(gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/commits" \
-                            --jq '.[].commit.message' 2>"$ERR_FILE"); then
+          # "#123" references: not glued to a word char, '&' (HTML entities) or '/' (URLs);
+          # leading zeros dropped. Output is one number per line.
+          extract_refs() {
+            grep -oP '(?<![\w&/])#\K[0-9]{1,9}(?!\w)' | sed 's/^0*//' | grep -v '^$'
+          }
+
+          pr_commit_messages() {   # $1 = PR number (the API returns at most 250 commits)
+            gh api --paginate "repos/${REPO}/pulls/$1/commits" --jq '.[].commit.message'
+          }
+
+          ref_kind() {             # $1 = number -> pr | issue | unknown
+            local k
+            if k=$(gh api "repos/${REPO}/issues/$1" \
+                     --jq 'if .pull_request then "pr" else "issue" end' 2>/dev/null); then
+              printf '%s' "$k"
+            else
+              printf 'unknown'
+            fi
+          }
+
+          read -r -d '' PR_QUERY <<'GQL'
+          query($owner: String!, $repo: String!, $number: Int!) {
+            repository(owner: $owner, name: $repo) {
+              pullRequest(number: $number) {
+                title
+                closingIssuesReferences(first: 50) { nodes { number } }
+              }
+            }
+          }
+          GQL
+
+          # Issues linked to a source PR (e.g. the PR on main that was cherry-picked):
+          # its title, its commit messages and its "closing" issue links.
+          resolve_source_pr() {    # $1 = PR number -> issue numbers, one per line
+            local resp
+            resp=$(gh api graphql -f query="$PR_QUERY" -f owner="$OWNER" -f repo="$NAME" \
+                     -F number="$1" 2>/dev/null)
+            {
+              jq -r '.data.repository.pullRequest.title // empty' <<<"$resp" 2>/dev/null
+              pr_commit_messages "$1" 2>/dev/null
+            } | extract_refs
+            jq -r '.data.repository.pullRequest.closingIssuesReferences.nodes[]?.number' \
+              <<<"$resp" 2>/dev/null
+          }
+
+          if ! MESSAGES=$(pr_commit_messages "$PR_NUMBER" 2>"$ERR_FILE"); then
             echo "::error::Could not list commits of PR #$PR_NUMBER: $(cat "$ERR_FILE")"
             exit 1
           fi
 
-          # Extract "#123" references: not glued to a word char, '&' (HTML entities)
-          # or '/' (URLs); de-duplicate; drop leading zeros; drop the PR's own number.
-          mapfile -t ISSUES < <(
-            printf '%s\n' "$MESSAGES" \
-              | grep -oP '(?<![\w&/])#\K[0-9]{1,9}(?!\w)' \
-              | sed 's/^0*//' \
-              | grep -v '^$' \
-              | grep -vx "$PR_NUMBER" \
-              | sort -nu
+          # Text of the PR being processed: its commits, title and description.
+          CURRENT_TEXT=$(printf '%s\n%s\n%s\n' "$MESSAGES" "$PR_TITLE" "$PR_BODY")
+
+          mapfile -t CANDIDATES < <(
+            printf '%s\n' "$CURRENT_TEXT" | extract_refs | grep -vx "$PR_NUMBER" | sort -nu
           )
+
+          # Cherry-picks: "(cherry picked from commit <sha>)" -> the PR(s) that sha belongs to.
+          SOURCE_PRS=()
+          for sha in $(printf '%s\n' "$CURRENT_TEXT" \
+                         | grep -oP 'cherry picked from commit \K[0-9a-f]{7,40}' | sort -u); do
+            for p in $(gh api "repos/${REPO}/commits/${sha}/pulls" --jq '.[].number' 2>/dev/null); do
+              echo "Cherry-picked commit ${sha:0:10} belongs to pull request #$p."
+              SOURCE_PRS+=("$p")
+            done
+          done
+
+          # A "#N" that is a pull request (e.g. squash-merge "Title (#123)" copied from main)
+          # is a cherry-pick source, not an issue.
+          ISSUE_REFS=()
+          for n in "${CANDIDATES[@]}"; do
+            if [ "$(ref_kind "$n")" = pr ]; then
+              echo "Reference #$n is a pull request (cherry-pick source). Resolving the issues it links."
+              SOURCE_PRS+=("$n")
+            else
+              ISSUE_REFS+=("$n")
+            fi
+          done
+
+          for p in $(printf '%s\n' "${SOURCE_PRS[@]:-}" | grep -v '^$' | grep -vx "$PR_NUMBER" | sort -nu); do
+            echo "Resolving issues linked to source pull request #$p."
+            for n in $(resolve_source_pr "$p" | grep -vx "$p" | grep -vx "$PR_NUMBER" | sort -nu); do
+              if [ "$(ref_kind "$n")" = pr ]; then
+                echo "  #$n is a pull request. Ignoring."
+              else
+                echo "  Found issue #$n."
+                ISSUE_REFS+=("$n")
+              fi
+            done
+          done
+
+          mapfile -t ISSUES < <(printf '%s\n' "${ISSUE_REFS[@]:-}" | grep -v '^$' | sort -nu)
 
           if [ "${#ISSUES[@]}" -eq 0 ]; then
             echo "No GitHub issue references found in the commits of PR #$PR_NUMBER. Nothing to do."
